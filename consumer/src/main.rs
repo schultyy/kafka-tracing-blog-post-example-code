@@ -1,27 +1,98 @@
-use kafka::consumer::{Consumer, FetchOffset};
-use tracing::{instrument, info};
+use opentelemetry::Key;
+use opentelemetry::StringValue;
+use opentelemetry::trace::Span;
+use opentelemetry::trace::Tracer;
 use opentelemetry::{global, sdk::propagation::TraceContextPropagator};
-use opentelemetry::sdk::{
-    trace::{self, RandomIdGenerator, Sampler},
-    Resource,
+use opentelemetry::{
+    sdk::{
+        trace::{self, RandomIdGenerator},
+        Resource,
+    },  KeyValue, 
 };
-use opentelemetry::KeyValue;
 use opentelemetry_otlp::WithExportConfig;
-use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::util::SubscriberInitExt;
+use rdkafka::{
+    config::RDKafkaLogLevel,
+    consumer::{
+        CommitMode, Consumer, ConsumerContext, Rebalance, StreamConsumer,
+    },
+    error::KafkaResult,
+    message::Headers,
+    ClientConfig, ClientContext, Message, TopicPartitionList,
+};
+use shared::HeaderExtractor;
 
-#[instrument]
-fn consume_topic(consumer: &mut Consumer) {
+struct CustomContext;
+
+impl ClientContext for CustomContext {}
+
+impl ConsumerContext for CustomContext {
+    fn pre_rebalance(&self, rebalance: &Rebalance) {
+        println!("Pre rebalance {:?}", rebalance);
+    }
+
+    fn post_rebalance(&self, rebalance: &Rebalance) {
+        println!("Post rebalance {:?}", rebalance);
+    }
+
+    fn commit_callback(&self, result: KafkaResult<()>, _offsets: &TopicPartitionList) {
+        println!("Committing offsets: {:?}", result);
+    }
+}
+
+// A type alias with your custom consumer can be created for convenience.
+type LoggingConsumer = StreamConsumer<CustomContext>;
+
+async fn consume_topic(broker: &str, topic: &str) {
+    let context = CustomContext;
+
+    let consumer: LoggingConsumer = ClientConfig::new()
+        .set("group.id", "-1")
+        .set("bootstrap.servers", broker)
+        .set_log_level(RDKafkaLogLevel::Debug)
+        .create_with_context(context)
+        .expect("failed to create consumer");
+
+    consumer
+        .subscribe(&vec![topic])
+        .expect("Can't subscribe to topics");
+
+    println!("Subscribed");
+
     loop {
-        for ms in consumer.poll().unwrap().iter() {
-            for m in ms.messages() {
-                let str = String::from_utf8_lossy(m.value);
-                info!(payload=str.to_string(), "Consumed");
+        match consumer.recv().await {
+            Err(e) => eprintln!("Kafka error: {}", e),
+            Ok(m) => {
+                let payload = match m.payload_view::<str>() {
+                    None => "",
+                    Some(Ok(s)) => s,
+                    Some(Err(e)) => {
+                        eprintln!("Error while deserializing message payload: {:?}", e);
+                        ""
+                    }
+                };
+                println!("key: '{:?}', payload: '{}', topic: {}, partition: {}, offset: {}, timestamp: {:?}",
+                      m.key(), payload, m.topic(), m.partition(), m.offset(), m.timestamp());
+                if let Some(headers) = m.headers() {
+                    for header in headers.iter() {
+                        if let Some(val) = header.value {
+                            println!(
+                                "  Header {:#?}: {:?}",
+                                header.key,
+                                String::from_utf8(val.to_vec())
+                            );
+                        }
+                    }
+                    let context = global::get_text_map_propagator(|propagator| {
+                        propagator.extract(&HeaderExtractor(&headers))
+                    });
+                    let mut span =
+                        global::tracer("consumer").start_with_context("consume_payload", &context);
+                    span.set_attribute(KeyValue { key: Key::new("payload"), value: opentelemetry::Value::String(StringValue::from(payload.to_string())) });
+                    span.end();
+                }
+                consumer.commit_message(&m, CommitMode::Async).unwrap();
             }
-            let _ = consumer.consume_messageset(ms);
-        }
-        consumer.commit_consumed().unwrap();
-        break;
+        };
     }
 }
 
@@ -30,7 +101,7 @@ pub fn init_tracer(
     collector_endpoint: String,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
     global::set_text_map_propagator(TraceContextPropagator::new());
-    let tracer = opentelemetry_otlp::new_pipeline()
+    let _ = opentelemetry_otlp::new_pipeline()
         .tracing()
         .with_exporter(
             opentelemetry_otlp::new_exporter()
@@ -39,7 +110,6 @@ pub fn init_tracer(
         )
         .with_trace_config(
             trace::config()
-                .with_sampler(Sampler::AlwaysOn)
                 .with_id_generator(RandomIdGenerator::default())
                 .with_max_events_per_span(64)
                 .with_max_attributes_per_span(16)
@@ -51,29 +121,14 @@ pub fn init_tracer(
         )
         .install_batch(opentelemetry::runtime::Tokio)?;
 
-    let telemetry = Some(tracing_opentelemetry::layer().with_tracer(tracer));
-
-    tracing_subscriber::registry()
-        .with(tracing_subscriber::EnvFilter::new(
-            std::env::var("RUST_LOG").unwrap_or_else(|_| "RUST_LOG=debug".into()),
-        ))
-        .with(tracing_subscriber::fmt::layer())
-        .with(telemetry)
-        .init();
     Ok(())
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
     init_tracer("kafka_consumer", "http://localhost:4317".into())?;
-    let mut consumer =
-    Consumer::from_hosts(vec!("localhost:9092".to_owned()))
-        .with_topic("hnstories".to_owned())
-        .with_fallback_offset(FetchOffset::Earliest)
-        .create()
-        .unwrap();
 
-    consume_topic(&mut consumer);
+    consume_topic("localhost:9092", "hnstories").await;
     println!("Finished");
 
     global::shutdown_tracer_provider(); // export remaining spans

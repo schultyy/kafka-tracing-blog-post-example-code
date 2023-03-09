@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use tracing::instrument;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct HackerNewsResponse {
@@ -19,7 +18,6 @@ pub struct HNSearchResult {
     pub points: u32,
 }
 
-#[instrument]
 pub async fn fetch_hn_stories(
     search_term: String,
     search_result_limit: u32,

@@ -2,6 +2,7 @@
 
 members = [
     "consumer",
-    "producer"
+    "producer",
+    "shared"
 ]
 
